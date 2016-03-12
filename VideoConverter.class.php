@@ -34,6 +34,7 @@
 			{
 				$this->_uniqueID = (!isset($_SESSION[parent::_SITENAME])) ? time() . "_" . uniqid('', true) : $_SESSION[parent::_SITENAME];
 				$_SESSION[parent::_SITENAME] = (!isset($_SESSION[parent::_SITENAME])) ? $this->_uniqueID : $_SESSION[parent::_SITENAME];
+				$_SESSION['execFFmpegToken'] = (!isset($_SESSION['execFFmpegToken'])) ? uniqid($this->_uniqueID, true) : $_SESSION['execFFmpegToken'];
 				if (parent::_ENABLE_IP_ROTATION) Database::Connect(parent::_SERVER, parent::_DB_USER, parent::_DB_PASSWORD, parent::_DATABASE);
 			}
 			else
@@ -112,15 +113,18 @@
 					}
 				}
 				//die($exec_string);
-				$ffmpegExecUrl = preg_replace('/(([^\/]+?)(\.php))$/', "exec_ffmpeg.php", "http://".$_SERVER['HTTP_HOST'].$_SERVER['PHP_SELF']);
-				$postData = "cmd=".urlencode($exec_string)."&token=".urlencode($this->_uniqueID);
-				$strCookie = 'PHPSESSID=' . $_COOKIE['PHPSESSID'] . '; path=/';
+				$protocol = ((!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] != 'off') || $_SERVER['SERVER_PORT'] == 443) ? "https://" : "http://";
+				$ffmpegExecUrl = preg_replace('/(([^\/]+?)(\.php))$/', "exec_ffmpeg.php", $protocol.$_SERVER['HTTP_HOST'].$_SERVER['PHP_SELF']);
+				$postData = "cmd=".urlencode($exec_string)."&token=".urlencode($_SESSION['execFFmpegToken']);
+				$strCookie = 'PHPSESSID=' . session_id() . '; path=/';
 				$ch = curl_init();
 				curl_setopt($ch, CURLOPT_URL, $ffmpegExecUrl);
-				curl_setopt($ch, CURLOPT_POST, TRUE);
+				curl_setopt($ch, CURLOPT_POST, true);
 				curl_setopt($ch, CURLOPT_POSTFIELDS, $postData);
-				curl_setopt($ch, CURLOPT_RETURNTRANSFER, TRUE);
+				curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
 				curl_setopt($ch, CURLOPT_TIMEOUT, 1);
+				curl_setopt($ch, CURLOPT_FOLLOWLOCATION, 1);
+				curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
 				curl_setopt($ch, CURLOPT_COOKIE, $strCookie);
 				curl_exec($ch);
 				curl_close($ch);
@@ -224,7 +228,7 @@
 		function PrepareConvertedFileNameForDownload($file)
 		{
 			$filename = urldecode($file);
-			$filename = end(explode(self::_FILENAME_DELIMITER, $filename));
+			$filename = current(array_reverse(explode(self::_FILENAME_DELIMITER, $filename)));
 			$ftypesForRegex = $this->GetConvertedFileTypes();
 			if (parent::_ENABLE_CONCURRENCY_CONTROL)
 			{
@@ -286,11 +290,28 @@
 					$filesystemIterator = new FilesystemIterator(realpath($dirName), FilesystemIterator::KEY_AS_FILENAME);
 					$regexIterator = new RegexIterator($filesystemIterator, '/^(('.preg_quote($fquality . self::_FILENAME_DELIMITER . $fvolume . self::_FILENAME_DELIMITER . $fname, '/').')((_uuid-)(\w+))?(\.)('.preg_quote($ftype, '/').'))$/', RegexIterator::MATCH, RegexIterator::USE_KEY);
 					$files = array_keys(iterator_to_array($regexIterator));
-					$fileName = (!empty($files)) ? $dirName . $files[0] : '';
+					if (!empty($files))
+					{
+						foreach ($files as $file)
+						{
+							if (is_file(realpath($dirName . $file)))
+							{
+								$fileName = $dirName . $file;
+								break;
+							}
+						}
+					}
 				}
 			}
 			//die($fileName);
 			return $fileName;
+		}
+
+		function FlushBuffer()
+		{
+			if (ob_get_length() > 0) ob_end_flush();
+			if (ob_get_length() > 0) ob_flush();
+			flush();
 		}
 		#endregion
 
@@ -316,16 +337,13 @@
 		private function UpdateVideoDownloadProgress($curlResource, $downloadSize, $downloaded, $uploadSize, $uploaded)
 		{
 			$httpCode = curl_getinfo($curlResource, CURLINFO_HTTP_CODE);
-			if ($httpCode == "200")
+			if ($httpCode == "200" && $downloadSize > 0)
 			{
-				$percent = @round($downloaded/$downloadSize, 2) * 100;
+				$percent = round($downloaded / $downloadSize, 2) * 100;
 				if ($percent > $this->_percentVidDownloaded)
 				{
 					$this->_percentVidDownloaded++;
-					echo '<script type="text/javascript">updateVideoDownloadProgress("'. $percent .'");</script>';
-					ob_end_flush();
-					ob_flush();
-					flush();
+					$this->OutputDownloadProgress($percent, true);
 				}
 			}
 		}
@@ -334,6 +352,12 @@
 		private function LegacyUpdateVideoDownloadProgress($downloadSize, $downloaded, $uploadSize, $uploaded)
 		{
 			$this->UpdateVideoDownloadProgress($this->_curlResource, $downloadSize, $downloaded, $uploadSize, $uploaded);
+		}
+
+		private function OutputDownloadProgress($percent, $isRealTime)
+		{
+			echo '<script type="text/javascript">updateVideoDownloadProgress("'. $percent .'", ' . (($isRealTime) ? 'true' : 'false') . ');</script>';
+			$this->FlushBuffer();
 		}
 
 		private function FilterUrls(array $urls)
@@ -399,53 +423,64 @@
 				$filename = (!$skipConversion) ? $this->GetTempVidFileName() : $this->GetConvertedFileName();
 				$tries = 0;
 				$forceBreak = false;
+				$isPlaylist = strrchr(end($urls[$vidCount]), ".") == ".m3u8";
+				$ffmpegOutput = array();
 				do
 				{
-					$file = fopen($filename, 'w');
-					$progressFunction = (parent::_PHP_VERSION >= 5.5) ? 'UpdateVideoDownloadProgress' : 'LegacyUpdateVideoDownloadProgress';
-					$this->_curlResource = $ch = curl_init();
-					curl_setopt($ch, CURLOPT_FILE, $file);
-					curl_setopt($ch, CURLOPT_HEADER, 0);
-					curl_setopt($ch, CURLOPT_URL, end($urls[$vidCount]));
-					curl_setopt($ch, CURLOPT_FOLLOWLOCATION, 1);
-					if (parent::_ENABLE_IP_ROTATION && $this->GetCurrentVidHost() == "YouTube")
+					if ($isPlaylist)
 					{
-						if ($this->GetOutgoingIP() == '' || $tries > 0) $this->SetOutgoingIP();
-						curl_setopt($ch, CURLOPT_REFERER, '');
-						curl_setopt($ch, CURLOPT_INTERFACE, $this->GetOutgoingIP());
-						curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, FALSE);
-						curl_setopt($ch, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
+						$this->OutputDownloadProgress(100, false);
+						exec(parent::_FFMPEG . ' -i ' . end($urls[$vidCount]) . ' -bsf:a aac_adtstoasc -c copy -y ' . $filename . ' 2>&1', $ffmpegOutput);
 					}
-					curl_setopt($ch, CURLOPT_NOPROGRESS, false);
-					curl_setopt($ch, CURLOPT_PROGRESSFUNCTION, array($this, $progressFunction));
-					curl_setopt($ch, CURLOPT_BUFFERSIZE, 4096000);
-					curl_setopt($ch, CURLOPT_USERAGENT, parent::_REQUEST_USER_AGENT);
-					curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-					curl_exec($ch);
-					if (curl_errno($ch) == 0)
+					else
 					{
-						$curlInfo = curl_getinfo($ch);
-						if (($this->GetCurrentVidHost() == "Dailymotion" || $this->GetCurrentVidHost() == "SoundCloud" || $this->GetCurrentVidHost() == "YouTube" || $this->GetCurrentVidHost() == "Pornhub") && $curlInfo['http_code'] == '302')
+						$file = fopen($filename, 'w');
+						$progressFunction = (parent::_PHP_VERSION >= 5.5) ? 'UpdateVideoDownloadProgress' : 'LegacyUpdateVideoDownloadProgress';
+						$this->_curlResource = $ch = curl_init();
+						curl_setopt($ch, CURLOPT_FILE, $file);
+						curl_setopt($ch, CURLOPT_HEADER, 0);
+						curl_setopt($ch, CURLOPT_URL, end($urls[$vidCount]));
+						curl_setopt($ch, CURLOPT_FOLLOWLOCATION, 1);
+						if (parent::_ENABLE_IP_ROTATION && $this->GetCurrentVidHost() == "YouTube")
 						{
-							if (isset($curlInfo['redirect_url']) && !empty($curlInfo['redirect_url']))
+							if ($this->GetOutgoingIP() == '' || $tries > 0) $this->SetOutgoingIP();
+							curl_setopt($ch, CURLOPT_REFERER, '');
+							curl_setopt($ch, CURLOPT_INTERFACE, $this->GetOutgoingIP());
+							curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, FALSE);
+							curl_setopt($ch, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
+						}
+						curl_setopt($ch, CURLOPT_NOPROGRESS, false);
+						curl_setopt($ch, CURLOPT_PROGRESSFUNCTION, array($this, $progressFunction));
+						curl_setopt($ch, CURLOPT_BUFFERSIZE, 4096000);
+						curl_setopt($ch, CURLOPT_USERAGENT, parent::_REQUEST_USER_AGENT);
+						curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+						curl_exec($ch);
+						if (curl_errno($ch) == 0)
+						{
+							$curlInfo = curl_getinfo($ch);
+							if (($this->GetCurrentVidHost() == "Dailymotion" || $this->GetCurrentVidHost() == "SoundCloud" || $this->GetCurrentVidHost() == "YouTube" || $this->GetCurrentVidHost() == "Pornhub") && $curlInfo['http_code'] == '302')
 							{
-								$urls[$vidCount][2] = $curlInfo['redirect_url'];
-								$vidCount--;
-								$forceBreak = parent::_ENABLE_IP_ROTATION && $this->GetCurrentVidHost() == "YouTube";
+								if (isset($curlInfo['redirect_url']) && !empty($curlInfo['redirect_url']))
+								{
+									$urls[$vidCount][2] = $curlInfo['redirect_url'];
+									$vidCount--;
+									$forceBreak = parent::_ENABLE_IP_ROTATION && $this->GetCurrentVidHost() == "YouTube";
+								}
+							}
+							if (method_exists($extractor, 'GetCypherUsed') && $extractor->GetCypherUsed() && $curlInfo['http_code'] == '403')
+							{
+								$extractor->FixDecryption();
 							}
 						}
-						if (method_exists($extractor, 'GetCypherUsed') && $extractor->GetCypherUsed() && $curlInfo['http_code'] == '403')
-						{
-							$extractor->FixDecryption();
-						}
+						curl_close($ch);
+						fclose($file);
 					}
-					curl_close($ch);
-					fclose($file);
 					if (is_file($filename))
 					{
-						if (!filesize($filename) || filesize($filename) < 10000)
+						if (!filesize($filename) || filesize($filename) < 10000 || ($isPlaylist && (empty($ffmpegOutput) || preg_match('/muxing overhead/i', end($ffmpegOutput)) != 1)))
 						{
 							unlink($filename);
+							$ffmpegOutput = array();
 						}
 						else
 						{
